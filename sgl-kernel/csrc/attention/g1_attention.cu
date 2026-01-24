@@ -1,143 +1,105 @@
-#include <torch/types.h>
-#include <cuda.h>
-#include <cuda_runtime.h>
-#include <cuda_fp16.h>
+// G1 Gate forward kernel
+#include <ATen/cuda/CUDAContext.h>
+#include <c10/cuda/CUDAGuard.h>
 
-__device__ __forceinline__ float sigmoid(float x) {
-    return 1.0f / (1.0f + __expf(-x));
+#include "pytorch_extension_utils.h"
+
+struct alignas(16) bf16x8 { __nv_bfloat162 v[4]; };
+
+__device__ __forceinline__
+bf16x8 load_bf16x8(const __nv_bfloat16* __restrict__ p) {
+  bf16x8 result;
+  *reinterpret_cast<float4*>(&result) = __ldg(reinterpret_cast<const float4*>(p));
+  return result;
 }
 
-__constant__ float fp4_e2m1_lut[16] = {
-    0.0f,  0.5f,  1.0f,  1.5f,  2.0f,  3.0f,  4.0f,  6.0f,
-   -0.0f, -0.5f, -1.0f, -1.5f, -2.0f, -3.0f, -4.0f, -6.0f
-};
-
-__device__ __forceinline__ void unpack_fp4_to_float(uint8_t packed, float scale, float* val1, float* val2) {
-    uint8_t low = packed & 0x0F;
-    uint8_t high = packed >> 4;
-
-    *val1 = fp4_e2m1_lut[low] * scale;
-    *val2 = fp4_e2m1_lut[high] * scale;
+__device__ __forceinline__
+void store_bf16x8(__nv_bfloat16* __restrict__ p, const bf16x8& x) {
+  *reinterpret_cast<bf16x8*>(p) = x;
 }
 
-__device__ __forceinline__ void load_128bit(const void* src, int4* dst) {
-    *dst = *reinterpret_cast<const int4*>(src);
+__device__ __forceinline__
+float fast_sigmoid(float x) {
+  return 1.f / (1.f + expf(-x));
 }
 
-__global__
-void forward_kernel_fp4(
-    const uint8_t* __restrict__ Q_packed,
-    const uint8_t* __restrict__ K_packed,
-    const uint8_t* __restrict__ V_packed,
-    const float* __restrict__ Gate_Logits,
-    const float scale_Q,
-    const float scale_K,
-    const float scale_V,
-    const int N, const int d,
-    const int Tc, const int Tr, const int Bc, const int Br,
-    const float softmax_scale,
-    float* __restrict__ l,
-    float* __restrict__ m,
-    float* __restrict__ O
+__device__ __forceinline__
+void compute_g1_gate(__nv_bfloat162 lin, __nv_bfloat162 attn,
+                     __nv_bfloat162& out, __nv_bfloat162& gate) {
+  float2 fl = __bfloat1622float2(lin);
+  float2 fa = __bfloat1622float2(attn);
+  float2 fg = {fast_sigmoid(fl.x), fast_sigmoid(fl.y)};
+  gate = __float22bfloat162_rn(fg);
+  out = __float22bfloat162_rn({fa.x * fg.x, fa.y * fg.y});
+}
+
+template <int BLOCK>
+__global__ void __launch_bounds__(BLOCK)
+g1_gate_fwd_kernel(
+    const __nv_bfloat16* __restrict__ linear_out,
+    const __nv_bfloat16* __restrict__ attn_out,
+    __nv_bfloat16* __restrict__ output,
+    __nv_bfloat16* __restrict__ gate,
+    int64_t n_total
 ) {
-    int tx = threadIdx.x;
-    int bx = blockIdx.x; int by = blockIdx.y;
+  const int64_t tid = int64_t(blockIdx.x) * BLOCK + threadIdx.x;
+  const int64_t stride = int64_t(gridDim.x) * BLOCK;
+  const int64_t n_vec8 = n_total / 8;
+  const int64_t rem_start = n_vec8 * 8;
 
-    int row_stride_bytes = d / 2;
+  for (int64_t i = tid; i < n_vec8; i += stride) {
+    const int64_t off = i * 8;
+    bf16x8 lin = load_bf16x8(linear_out + off);
+    bf16x8 attn = load_bf16x8(attn_out + off);
+    bf16x8 o, g;
+    #pragma unroll
+    for (int j = 0; j < 4; j++)
+      compute_g1_gate(lin.v[j], attn.v[j], o.v[j], g.v[j]);
+    store_bf16x8(output + off, o);
+    store_bf16x8(gate + off, g);
+  }
 
-    size_t batch_head_offset_bytes = (bx * gridDim.y * N * row_stride_bytes) + (by * N * row_stride_bytes);
-    size_t batch_head_offset_elems = (bx * gridDim.y * N * d) + (by * N * d);
+  for (int64_t i = rem_start + tid; i < n_total; i += stride) {
+    float fl = __bfloat162float(linear_out[i]);
+    float fa = __bfloat162float(attn_out[i]);
+    float fg = fast_sigmoid(fl);
+    gate[i] = __float2bfloat16(fg);
+    output[i] = __float2bfloat16(fa * fg);
+  }
+}
 
-    int lm_offset = (bx * gridDim.y * N) + (by * N);
+void g1_gate_forward(
+    at::Tensor linear_out,
+    at::Tensor attn_out,
+    at::Tensor output,
+    at::Tensor gate) {
+  CHECK_INPUT(linear_out);
+  CHECK_INPUT(attn_out);
+  CHECK_INPUT(output);
+  CHECK_INPUT(gate);
+  CHECK_EQ(linear_out.dtype(), at::kBFloat16);
+  CHECK_EQ(attn_out.dtype(), at::kBFloat16);
+  CHECK_EQ(linear_out.numel(), attn_out.numel());
+  CHECK_EQ(output.numel(), linear_out.numel());
+  CHECK_EQ(gate.numel(), linear_out.numel());
 
-    extern __shared__ float sram[];
-    int tile_size_floats = Bc * d;
+  int64_t n = linear_out.numel();
+  if (n <= 0) return;
 
-    float* Qi = sram;
-    float* Kj = &sram[tile_size_floats];
-    float* Vj = &sram[tile_size_floats * 2];
-    float* S  = &sram[tile_size_floats * 3];
+  const c10::cuda::OptionalCUDAGuard device_guard(linear_out.device());
+  auto stream = at::cuda::getCurrentCUDAStream();
 
-    for (int j = 0; j < Tc; j++) {
+  constexpr int BLOCK = 256;
+  int sm_count;
+  cudaDeviceGetAttribute(&sm_count, cudaDevAttrMultiProcessorCount,
+                         linear_out.get_device());
+  int blocks = std::min(sm_count * 4, int((n + BLOCK * 8 - 1) / (BLOCK * 8)));
+  if (blocks < 1) blocks = 1;
 
-        for (int x_bytes = tx; x_bytes < row_stride_bytes; x_bytes += Bc) {
-            int k_idx = batch_head_offset_bytes + (j * Bc * row_stride_bytes) + x_bytes;
-
-            uint8_t k_val_packed = K_packed[k_idx];
-            uint8_t v_val_packed = V_packed[k_idx];
-
-            float k1, k2, v1, v2;
-            unpack_fp4_to_float(k_val_packed, scale_K, &k1, &k2);
-            unpack_fp4_to_float(v_val_packed, scale_V, &v1, &v2);
-
-            Kj[(x_bytes * 2)]     = k1;
-            Kj[(x_bytes * 2) + 1] = k2;
-            Vj[(x_bytes * 2)]     = v1;
-            Vj[(x_bytes * 2) + 1] = v2;
-        }
-        __syncthreads();
-
-        for (int i = 0; i < Tr; i++)  {
-
-            for (int x_bytes = tx; x_bytes < row_stride_bytes; x_bytes += Bc) {
-                int q_idx = batch_head_offset_bytes + (i * Br * row_stride_bytes) + x_bytes;
-                uint8_t q_val_packed = Q_packed[q_idx];
-
-                float q1, q2;
-                unpack_fp4_to_float(q_val_packed, scale_Q, &q1, &q2);
-
-                Qi[(x_bytes * 2)]     = q1;
-                Qi[(x_bytes * 2) + 1] = q2;
-            }
-            __syncthreads();
-
-            float row_m_prev = m[lm_offset + (Br * i) + tx];
-            float row_l_prev = l[lm_offset + (Br * i) + tx];
-            float row_m = -INFINITY;
-
-            for (int y = 0; y < Bc; y++) {
-                float sum = 0;
-                for (int x = 0; x < d; x++) {
-                    sum += Qi[(tx * d) + x] * Kj[(y * d) + x];
-                }
-                sum *= softmax_scale;
-                S[(Bc * tx) + y] = sum;
-
-                if (sum > row_m) row_m = sum;
-            }
-
-            float row_l = 0;
-            for (int y = 0; y < Bc; y++) {
-                S[(Bc * tx) + y] = __expf(S[(Bc * tx) + y] - row_m);
-                row_l += S[(Bc * tx) + y];
-            }
-
-            float row_m_new = max(row_m_prev, row_m);
-            float row_l_new = (__expf(row_m_prev - row_m_new) * row_l_prev) + (__expf(row_m - row_m_new) * row_l);
-
-            for (int x = 0; x < d; x++) {
-                float pv = 0;
-                for (int y = 0; y < Bc; y++) {
-                    pv += S[(Bc * tx) + y] * Vj[(y * d) + x];
-                }
-
-                int global_out_idx = batch_head_offset_elems + (i * Br * d) + (tx * d) + x;
-                float old_O = O[global_out_idx];
-
-                float current_O = (1 / row_l_new) *
-                    ((row_l_prev * __expf(row_m_prev - row_m_new) * old_O)
-                    + (__expf(row_m - row_m_new) * pv));
-
-                if (j == Tc - 1) {
-                    float gate_logit = Gate_Logits[global_out_idx];
-                    float gate_val = sigmoid(gate_logit);
-                    current_O = current_O * gate_val;
-                }
-                O[global_out_idx] = current_O;
-            }
-            m[lm_offset + (Br * i) + tx] = row_m_new;
-            l[lm_offset + (Br * i) + tx] = row_l_new;
-        }
-        __syncthreads();
-    }
+  g1_gate_fwd_kernel<BLOCK><<<blocks, BLOCK, 0, stream>>>(
+      reinterpret_cast<const __nv_bfloat16*>(linear_out.data_ptr()),
+      reinterpret_cast<const __nv_bfloat16*>(attn_out.data_ptr()),
+      reinterpret_cast<__nv_bfloat16*>(output.data_ptr()),
+      reinterpret_cast<__nv_bfloat16*>(gate.data_ptr()),
+      n);
 }

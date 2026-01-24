@@ -45,6 +45,22 @@ def merge_state_v2(
     return v_merged, s_merged
 
 
+def g1_gate_forward(
+    linear_out: torch.Tensor,
+    attn_out: torch.Tensor,
+    output: Optional[torch.Tensor] = None,
+    gate: Optional[torch.Tensor] = None,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    if output is None:
+        output = torch.empty_like(attn_out)
+    if gate is None:
+        gate = torch.empty_like(attn_out)
+    torch.ops.sgl_kernel.g1_gate_forward.default(
+        linear_out, attn_out, output, gate
+    )
+    return output, gate
+
+
 def cutlass_mla_decode(
     q_nope: torch.Tensor,
     q_pe: torch.Tensor,
